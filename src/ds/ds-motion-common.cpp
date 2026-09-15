@@ -2,9 +2,12 @@
 // Copyright(c) 2022-4 RealSense, Inc. All Rights Reserved.
 
 #include "ds-motion-common.h"
+#include <cstdlib>
 
 #include "algo.h"
 #include "hid-sensor.h"
+#include "uvc-sensor.h"
+#include "platform/gmsl-imu-batch.h"
 #include "environment.h"
 #include "metadata.h"
 #include "backend.h"
@@ -144,6 +147,94 @@ namespace librealsense
         : synthetic_sensor( name, sensor, owner, motion_fourcc_to_rs2_format, motion_fourcc_to_rs2_stream )
         , _owner( owner )
     {
+    }
+
+    namespace {
+        std::vector<uint8_t> imu_batch_command(const std::shared_ptr<hw_monitor>& hwm,
+                                               unsigned op, unsigned mask) {
+            return hwm->send(command(0x80, 0x42554d49, 1, op, mask));
+        }
+        bool is_imu_batch_response(const std::vector<uint8_t>& r) {
+            return r.size()==8 && gmsl_imu_batch::has_magic(r.data(),r.size()) && r[4]==1;
+        }
+    }
+
+    void ds_motion_sensor::open(const stream_profiles& requests)
+    {
+        if (is_opened()) {
+            synthetic_sensor::open(requests); // preserve the existing session on error
+            return;
+        }
+        // Logical requests are still available here, before synthetic profile merging.
+        // USB HID sensors and firmware without IMUB capability retain their path.
+        std::shared_ptr<hw_monitor> hwm;
+        if (!is_opened() && std::dynamic_pointer_cast<uvc_sensor>(get_raw_sensor())) {
+            if (auto dev=dynamic_cast<const d400_motion_uvc*>(_owner))
+                hwm=dev->_ds_motion_common->_hw_monitor;
+            else if (auto dev=dynamic_cast<const d500_motion*>(_owner))
+                hwm=dev->_ds_motion_common->_hw_monitor;
+        }
+        bool supported=false;
+        if (hwm) {
+            try {
+                auto r=imu_batch_command(hwm,0,0);
+                supported=is_imu_batch_response(r) && r[6]==1;
+            } catch (const std::exception& e) {
+                LOG_DEBUG("IMU pair capability unavailable: " << e.what());
+            }
+        }
+        if (supported) {
+            unsigned mask=0; int fps=0;
+            for (const auto& request:requests) {
+                const auto type=request->get_stream_type();
+                if (type!=RS2_STREAM_ACCEL && type!=RS2_STREAM_GYRO)
+                    throw invalid_value_exception("IMUB accepts only accel/gyro requests");
+                if (fps!=0 && fps!=request->get_framerate())
+                    throw invalid_value_exception("IMUB requires equal accel and gyro rates");
+                fps=request->get_framerate();
+                mask |= type==RS2_STREAM_ACCEL ? 1U : 2U;
+            }
+            if (mask==0) throw invalid_value_exception("IMUB requires a motion stream");
+            // Explicit diagnostic opt-out permits a same-library, same-profile
+            // A/B comparison. Default operation remains paired framing.
+            if (const char* setting = std::getenv("RS2_GMSL_IMU_BATCH")) {
+                const std::string value(setting);
+                if (value != "0" && value != "1")
+                    throw invalid_value_exception("RS2_GMSL_IMU_BATCH must be 0 or 1");
+                if (value == "0") mask = 0;
+            }
+            // UVC open() issues STREAMON; start()/stop() only gate callbacks.
+            // Negotiate before open, while firmware can still change framing.
+            auto r=imu_batch_command(hwm,1,mask);
+            if (!is_imu_batch_response(r) || r[5]!=mask || r[7]!=0)
+                throw std::runtime_error("HKR rejected IMU requested sensor mask");
+            _gmsl_batch_monitor=hwm;
+            _gmsl_batch_mask=mask;
+        }
+        try {
+            synthetic_sensor::open(requests);
+        } catch (...) {
+            if (_gmsl_batch_monitor) {
+                try { imu_batch_command(_gmsl_batch_monitor,1,0); }
+                catch (const std::exception& e) { LOG_WARNING("IMUB rollback failed: " << e.what()); }
+            }
+            _gmsl_batch_monitor.reset();
+            _gmsl_batch_mask=0;
+            throw;
+        }
+    }
+
+    void ds_motion_sensor::close()
+    {
+        synthetic_sensor::close();
+        if (_gmsl_batch_monitor) {
+            auto hwm=_gmsl_batch_monitor;
+            _gmsl_batch_monitor.reset();
+            _gmsl_batch_mask=0;
+            auto r=imu_batch_command(hwm,1,0);
+            if (!is_imu_batch_response(r) || r[5]!=0)
+                throw std::runtime_error("HKR did not clear IMU pair configuration");
+        }
     }
 
     rs2_motion_device_intrinsic ds_motion_sensor::get_motion_intrinsics(rs2_stream stream) const
