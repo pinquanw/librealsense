@@ -102,8 +102,7 @@ namespace librealsense
         std::shared_ptr<stream_interface> get_accel_stream() const;
         std::shared_ptr<stream_interface> get_gyro_stream() const;
 
-        std::shared_ptr<hw_monitor> _gmsl_batch_monitor;
-        unsigned _gmsl_batch_mask = 0;
+        std::shared_ptr<uvc_sensor> _gmsl_batch_sensor;
         const device* _owner;
     };
 
