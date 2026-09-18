@@ -1874,12 +1874,23 @@ namespace librealsense
                                                     for (unsigned i = 0; i < count; ++i) {
                                                         samples[i] = std::make_shared<owned_imu_sample>();
                                                         auto& bytes = samples[i]->bytes;
-                                                        memcpy(bytes.data(), wire + gmsl_imu_batch::header_bytes + i*gmsl_imu_batch::record_bytes, 40);
+                                                        memcpy(bytes.data(), wire + gmsl_imu_batch::header_bytes + i*gmsl_imu_batch::record_bytes, gmsl_imu_batch::record_bytes);
                                                         // Internal sample trailer: full source sequence at 32,
                                                         // tag at 40. It is never transmitted to the camera.
                                                         memcpy(bytes.data()+40, "IMS1", 4);
                                                     }
                                                     buf_mgr.request_next_frame();
+                                                    if (!count) {
+                                                        ++_invalid_imu_batch_packets;
+                                                        const auto now = std::chrono::steady_clock::now();
+                                                        if (_invalid_imu_batch_packets == 1 ||
+                                                            now - _last_imu_batch_warning >= std::chrono::seconds(1)) {
+                                                            _last_imu_batch_warning = now;
+                                                            LOG_WARNING("Discarding invalid IMUB packet on " << _name
+                                                                << ": bytes=" << frame_sz
+                                                                << ", total=" << _invalid_imu_batch_packets);
+                                                        }
+                                                    }
                                                     // Optional receive evidence, after re-queueing the VI buffer.
                                                     // Keep the transport sequence distinct from sensor sequences.
                                                     static const bool trace_packets = std::getenv("RS2_GMSL_IMU_PACKET_TRACE") != nullptr;

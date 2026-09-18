@@ -3,6 +3,8 @@
 
 #include "ds-motion-common.h"
 #include <cstdlib>
+#include <chrono>
+#include <thread>
 
 #include "algo.h"
 #include "hid-sensor.h"
@@ -179,6 +181,24 @@ namespace librealsense
                     throw std::runtime_error("HKR rejected IMU batch XU configuration");
             });
         }
+
+        void disable_imu_batch(const std::shared_ptr<uvc_sensor>& sensor)
+        {
+            try {
+                // STREAMOFF may return before HKR releases the IMU source.
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+                while (query_imu_batch(sensor) & imu_batch_active) {
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        throw std::runtime_error("Timed out waiting for IMU source release");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                configure_imu_batch(sensor, 0);
+            } catch (const std::exception& e) {
+                LOG_WARNING("IMUB XU cleanup failed: " << e.what());
+            } catch (...) {
+                LOG_WARNING("IMUB XU cleanup failed with an unknown error");
+            }
+        }
     }
 
     void ds_motion_sensor::open(const stream_profiles& requests)
@@ -214,7 +234,7 @@ namespace librealsense
             if (const char* setting = std::getenv("RS2_GMSL_IMU_BATCH")) {
                 const std::string value(setting);
                 if (value != "0" && value != "1")
-                    throw invalid_value_exception("RS2_GMSL_IMU_BATCH must be 0 or 1");
+                    LOG_WARNING("Ignoring RS2_GMSL_IMU_BATCH: expected 0 or 1, using automatic negotiation");
                 if (value == "0") mask = 0;
             }
         }
@@ -227,10 +247,8 @@ namespace librealsense
             }
             synthetic_sensor::open(requests);
         } catch (...) {
-            if (_gmsl_batch_sensor) {
-                try { configure_imu_batch(_gmsl_batch_sensor, 0); }
-                catch (const std::exception& e) { LOG_WARNING("IMUB XU rollback failed: " << e.what()); }
-            }
+            if (_gmsl_batch_sensor)
+                disable_imu_batch(_gmsl_batch_sensor);
             _gmsl_batch_sensor.reset();
             throw;
         }
@@ -242,7 +260,7 @@ namespace librealsense
         if (_gmsl_batch_sensor) {
             auto raw = _gmsl_batch_sensor;
             _gmsl_batch_sensor.reset();
-            configure_imu_batch(raw, 0);
+            disable_imu_batch(raw);
         }
     }
 
